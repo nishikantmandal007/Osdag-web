@@ -1,8 +1,14 @@
 import logging
 import math
 import numpy as np
-from PySide6.QtWidgets import QDialog
-from PySide6.QtCore import Qt
+# PySide6 is only available in the desktop app; wrap import so this file
+# can still be imported in the web backend where PySide6 is not installed.
+try: 
+    from PySide6.QtWidgets import QDialog
+    from PySide6.QtCore import Qt
+except ImportError:  # pragma: no cover
+    QDialog = None
+    Qt = None
 
 from ....Common import *
 from ....utils.common.material import *
@@ -16,10 +22,13 @@ from ....utils.common.Section_Properties_Calculator import BBAngle_Properties
 from ....utils.common import is800_2007
 from ....utils.common.Unsymmetrical_Section_Properties import Unsymmetrical_I_Section_Properties
 
-# New imports
-from ....Common import *
-from ..gui.dialogs import RangeInputDialog, PopupDialog
-from ..gui.widgets import My_ListWidget, My_ListWidgetItem
+# GUI related imports (handled gracefully)
+try:
+    from ..gui.dialogs import RangeInputDialog, PopupDialog
+    from ..gui.widgets import My_ListWidget, My_ListWidgetItem
+except (ImportError, TypeError):
+    RangeInputDialog = PopupDialog = My_ListWidget = My_ListWidgetItem = None
+
 from .section import Section, calc_yj, shear_stress_unsym_I, classify_section
 from .pso_optimizer import GlobalBestPSO
 from ..optimization.intelligent_pso import IntelligentPSO
@@ -61,6 +70,9 @@ class PlateGirderWelded(Member):
         self.deflection_skipped = False
         self.hover_dict = {}  # Required for CAD display tooltips
         self.mainmodule = 'PLATE GIRDER'  # Required for CommonDesignLogic routing
+        self.moment_ratio = 0.0
+        self.shear_ratio = 0.0
+        self.deflection_ratio = 0.0
         
         # Configuration control
         self.debug = DEBUG_MODE
@@ -409,8 +421,7 @@ class PlateGirderWelded(Member):
         if not isinstance(self.logger, CustomLogger):
             logging.getLogger(unique_logger_name).manager.loggerDict.pop(unique_logger_name, None)
             self.logger = logging.getLogger(f"{unique_logger_name}_{id}")
-        if isinstance(self.logger, CustomLogger):
-            self.logger.clear_logs()
+        
         # Clear any existing handlers
         self.logger.handlers.clear()
         self.logger.setLevel(logging.DEBUG)
@@ -940,28 +951,37 @@ class PlateGirderWelded(Member):
         self.section_class = None
         if self.design_type == 'Optimized':
             self.total_depth = 1
-            if design_dictionary[KEY_WEB_THICKNESS_PG] == 'All':
+            # Handle Web Thickness (could be string 'All', a single string, or a list from Web UI)
+            web_val = design_dictionary[KEY_WEB_THICKNESS_PG]
+            if web_val == 'All':
                 self.web_thickness_list = VALUES_PLATETHK_CUSTOMIZED
-                self.web_thickness = float(VALUES_PLATETHK_CUSTOMIZED[0])
+            elif isinstance(web_val, list):
+                self.web_thickness_list = web_val
             else:
-                self.web_thickness_list = [design_dictionary[KEY_WEB_THICKNESS_PG]]
-                self.web_thickness = float(design_dictionary[KEY_WEB_THICKNESS_PG])
+                self.web_thickness_list = [web_val]
+            self.web_thickness = float(self.web_thickness_list[0])
 
             self.top_flange_width = 1
-            if design_dictionary[KEY_TOP_FLANGE_THICKNESS_PG] == 'All':
+            # Handle Top Flange Thickness
+            tf_val = design_dictionary[KEY_TOP_FLANGE_THICKNESS_PG]
+            if tf_val == 'All':
                 self.top_flange_thickness_list = VALUES_PLATETHK_CUSTOMIZED
-                self.top_flange_thickness = float(VALUES_PLATETHK_CUSTOMIZED[0])
+            elif isinstance(tf_val, list):
+                self.top_flange_thickness_list = tf_val
             else:
-                self.top_flange_thickness_list = [design_dictionary[KEY_TOP_FLANGE_THICKNESS_PG]]
-                self.top_flange_thickness = float(design_dictionary[KEY_TOP_FLANGE_THICKNESS_PG])
+                self.top_flange_thickness_list = [tf_val]
+            self.top_flange_thickness = float(self.top_flange_thickness_list[0])
 
             self.bottom_flange_width = 1
-            if design_dictionary[KEY_BOTTOM_FLANGE_THICKNESS_PG] == 'All':
+            # Handle Bottom Flange Thickness
+            bf_val = design_dictionary[KEY_BOTTOM_FLANGE_THICKNESS_PG]
+            if bf_val == 'All':
                 self.bottom_flange_thickness_list = VALUES_PLATETHK_CUSTOMIZED
-                self.bottom_flange_thickness = float(VALUES_PLATETHK_CUSTOMIZED[0])
+            elif isinstance(bf_val, list):
+                self.bottom_flange_thickness_list = bf_val
             else:
-                self.bottom_flange_thickness_list = [design_dictionary[KEY_BOTTOM_FLANGE_THICKNESS_PG]]
-                self.bottom_flange_thickness = float(design_dictionary[KEY_BOTTOM_FLANGE_THICKNESS_PG])
+                self.bottom_flange_thickness_list = [bf_val]
+            self.bottom_flange_thickness = float(self.bottom_flange_thickness_list[0])
 
         else:
             self.total_depth = float(design_dictionary[KEY_OVERALL_DEPTH_PG])
@@ -1831,13 +1851,20 @@ class PlateGirderWelded(Member):
             # 1. Stiffener Spacing Limits (IS 800 Cl. 8.7.2.4)
             # 0.5d <= c <= 3d
             eff_d = self.total_depth - self.top_flange_thickness - self.bottom_flange_thickness
+            
+            # Safe conversion of spacing 'c'
+            try:
+                c_val = float(self.c) if (self.c is not None and str(self.c).upper() != "NA") else 1.5 * eff_d
+            except (ValueError, TypeError):
+                c_val = 1.5 * eff_d # Default to passing middle value if NA
+
             min_c = 0.5 * eff_d
             max_c = 3.0 * eff_d
             
-            if self.c < min_c: 
-                penalty += 1.0 + (min_c - self.c)/100.0  # Proportional penalty
-            elif self.c > max_c:
-                penalty += 1.0 + (self.c - max_c)/100.0
+            if c_val < min_c: 
+                penalty += 1.0 + (min_c - c_val)/100.0  # Proportional penalty
+            elif c_val > max_c:
+                penalty += 1.0 + (c_val - max_c)/100.0
 
             # 2. Stiffener Thickness Limit (IS 800 Cl. 8.7.1.3)
             # t >= d/50
@@ -2330,12 +2357,12 @@ class PlateGirderWelded(Member):
 
         self.design_check(design_dictionary)
 
-    # 5. Objective function
     def objective_function(self, particle, variable_list, design_dictionary, is_symmetric, is_thick_web):
         """
         particle: 1D array of design variables for a single particle
         returns: scalar cost
         """
+        print(f"DEBUG: objective_function called for particle {particle[:3]}...")
         cost = self.evaluate_particle_cost(particle, variable_list, design_dictionary, is_symmetric, is_thick_web)
         return cost
     

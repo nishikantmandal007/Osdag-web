@@ -16,6 +16,7 @@ import {
 import { BaseInputDock } from "./BaseInputDock";
 import { BaseOutputDock } from "./BaseOutputDock";
 import { CustomizationModal } from "../components/CustomizationModal";
+import { ThicknessSelectionModal } from "../../flexuralMember/plateGirder/components/ThicknessSelectionModal";
 import { DesignReportModal } from "../components/DesignReportModal";
 import { DesignStatusModal } from "./DesignStatusModal";
 import { DESIGN_STATUS } from "../hooks/useDesignSubmission";
@@ -37,6 +38,9 @@ import { isGuestUser, canCreateProjects } from "../../../utils/auth";
 import { expandAllSelectedInputs } from "../utils/osiInputSerializer";
 import ProjectNameModal from "../../../homepage/components/ProjectNameModal";
 import { useProjectCreation } from '../hooks/useProjectCreation';
+import OptimizationGraph from "./OptimizationGraph";
+import PSODashboard from "../../flexuralMember/plateGirder/components/PSODashboard";
+
 
 export const EngineeringModule = ({
   moduleConfig,
@@ -162,6 +166,58 @@ export const EngineeringModule = ({
   const [isLandscape, setIsLandscape] = useState(false);
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
   const [showCad, setShowCad] = useState(window.innerWidth >= 768); // Default: true on desktop, false on mobile
+  const [isWsConnected, setIsWsConnected] = useState(false);
+  const [showOptimizationGraph, setShowOptimizationGraph] = useState(false);
+  const [optimizationDone, setOptimizationDone] = useState(false);
+  const [optimizationData, setOptimizationData] = useState({
+    current_iter: 0,
+    variableNames: [],
+    bounds: { lb: [], ub: [] },
+    history: [],
+    currentSwarm: [],
+    globalBest: null
+  });
+
+  const [customBgColor, setCustomBgColor] = useState(null);
+  const colorPickerRef = useRef(null);
+
+  // Prepare data for Plotly OptimizationGraph
+  const plotlyData = useMemo(() => {
+    const fease = { x: [], y: [], z: [], text: [] };
+    const non_fease = { x: [], y: [], z: [], text: [] };
+    
+    (optimizationData.history || []).forEach(p => {
+      if (p.ur <= 1.0) {
+        fease.x.push(p.ur);
+        fease.y.push(p.depth);
+        fease.z.push(p.weight_kg);
+        fease.text.push(`Iter: ${p.iter}, P: ${p.particle}`);
+      } else {
+        non_fease.x.push(p.ur);
+        non_fease.y.push(p.depth);
+        non_fease.z.push(p.weight_kg);
+        non_fease.text.push(`Iter: ${p.iter}, P: ${p.particle}`);
+      }
+    });
+
+    return {
+      current_iter: optimizationData.current_iter,
+      variableNames: optimizationData.variableNames,
+      bounds: optimizationData.bounds,
+      fease,
+      non_fease,
+      best: {
+        found: !!optimizationData.globalBest,
+        x: optimizationData.globalBest ? [optimizationData.globalBest.ur] : [],
+        y: optimizationData.globalBest ? [optimizationData.globalBest.depth] : [],
+        z: optimizationData.globalBest ? [optimizationData.globalBest.weight_kg] : [],
+        val: optimizationData.globalBest?.weight_kg || 0,
+        iter: (optimizationData.globalBest?.iter || 0) + 1,
+        particle: (optimizationData.globalBest?.particle || 0) + 1,
+        vars: optimizationData.globalBest?.vars || {}
+      }
+    };
+  }, [optimizationData]);
 
   const { handleCreateProject, projectCreationModal } = useProjectCreation({
     inputs,
@@ -229,10 +285,20 @@ export const EngineeringModule = ({
     console.log(`[DOCK] showInputDock changed: ${showInputDock}`);
   }, [showInputDock]);
 
-  // Log showOutputDock state changes
   useEffect(() => {
     console.log(`[DOCK] showOutputDock changed: ${showOutputDock}`);
   }, [showOutputDock]);
+
+  // Handle Graphics menu actions (Background Color change) 
+  useEffect(() => {
+    if (inputs?.graphicsOption === "Change Background") {
+      if (colorPickerRef.current) {
+        colorPickerRef.current.click();
+      }
+      // Reset graphicsOption so it can be triggered again
+      setInputs(prev => ({ ...prev, graphicsOption: null }));
+    }
+  }, [inputs?.graphicsOption]);
 
   // Log showLogs state changes
   useEffect(() => {
@@ -500,7 +566,257 @@ export const EngineeringModule = ({
 
     // Call the actual submit function
     try {
-      await handleSubmit();
+      // Automatic detection for Plate Girder Optimization (PSO)
+      if (moduleConfig.designType === "Plate-Girder") {
+        const isOptimizedType = inputs?.design_type === "Optimized";
+        const hasAllSelection = 
+          selectionStates?.webThicknessSelect === "All" || 
+          selectionStates?.topFlangeThicknessSelect === "All" || 
+          selectionStates?.bottomFlangeThicknessSelect === "All";
+        
+        if (isOptimizedType || hasAllSelection) {
+          extraState.optimizedInputs = true;
+          console.log("[PSO] Optimization detected, launching real-time dashboard");
+        }
+      }
+
+      if (extraState.optimizedInputs) {
+        let sequence = -1; // to track and drop out-of-order messages.
+        setShowOptimizationGraph(true); 
+        service.getRTUpdates("ws/optimize/plate-girder/",
+          (ev) => {
+            setIsWsConnected(true);
+            const ws = ev.target
+            ws.send(JSON.stringify({
+              type: "start_optimization",
+              data: inputs
+            }
+            ));
+
+            setOptimizationData({
+              current_iter: 0,
+              variableNames: [],
+              bounds: { lb: [], ub: [] },
+              history: [],
+              currentSwarm: [],
+              globalBest: null
+            });
+            setOptimizationDone(false);
+
+            // DEMO DATA GENERATOR: If no real data comes in within 2 seconds, show sample points
+            // setTimeout(() => {
+            //   setOptimizationData(prev => {
+            //     if (prev.history.length > 0) return prev; // Live data already here
+                
+            //     console.log("[PSO] No live data received, populating DEMO data...");
+            //     const demoHistory = [];
+            //     for (let i = 0; i < 40; i++) {
+            //       const isFeasible = Math.random() > 0.4;
+            //       const ur = isFeasible ? 0.6 + Math.random() * 0.4 : 1.0 + Math.random() * 0.5;
+            //       const depth = 800 + Math.random() * 1200;
+            //       const weight = 8000 + (ur * 5000) + (depth * 10);
+                  
+            //       demoHistory.push({
+            //         ur,
+            //         depth,
+            //         weight_kg: weight,
+            //         iter: 1,
+            //         particle: i + 1,
+            //         vars: { D: depth, tw: 12, bf: 450, tf: 25 },
+            //         timestamp: Date.now()
+            //       });
+            //     }
+                
+            //     return {
+            //       ...prev,
+            //       history: demoHistory,
+            //       current_iter: 1,
+            //       variableNames: ["D", "tw", "bf", "tf"],
+            //       globalBest: demoHistory.filter(p => p.ur <= 1.0).sort((a,b) => a.weight_kg - b.weight_kg)[0] || demoHistory[0]
+            //     };
+            //   });
+            // }, 2500);
+          },
+          (event) => {
+            const msg = JSON.parse(event.data);
+            console.log("[PSO] Message received:", msg.type, msg.data?.iteration);
+            
+            // Fix: Guard against undefined sequences that break the comparison
+            const msgSequence = msg.data.sequence !== undefined ? msg.data.sequence : -2;
+            
+            if (msgSequence > sequence || msgSequence === -2) {
+              if (msgSequence !== -2) sequence = msgSequence;
+              
+              switch (msg.type) {
+                case "task_started":
+                  break;
+                case "pso_update":
+                  setOptimizationData((prev) => {
+                    // Map variables to a dict
+                    const varsDict = {};
+                    (msg.data.variable_names || []).forEach((name, idx) => {
+                      varsDict[name] = (msg.data.variables || [])[idx];
+                    });
+
+                    const particleData = {
+                      ur: msg.data.ur,
+                      weight_kg: msg.data.weight_kg,
+                      depth: varsDict['D'] || msg.data.depth,
+                      tw: varsDict['tw'],
+                      tf: varsDict['tf'] || varsDict['tf_top'],
+                      bf: varsDict['bf'] || varsDict['bf_top'],
+                      vars: varsDict,
+                      particle: msg.data.particle_index,
+                      iter: msg.data.iteration,
+                      timestamp: Date.now()
+                    };
+                    
+                    const plotImage = msg.data.plot_image || prev.plotImage;
+                    if (msg.data.plot_image) {
+                        console.log("[PSO] Image received! Length:", msg.data.plot_image.length);
+                    }
+
+                    // Update variable names and bounds if provided (usually in first message)
+                    const variableNames = msg.data.variable_names || prev.variableNames;
+                    const bounds = msg.data.bounds || prev.bounds;
+
+                    // Add to history (keep last 10000 entries)
+                    const newHistory = [...prev.history, particleData].slice(-10000);
+
+                    // Group current swarm by iteration (keep only current iteration)
+                    const currentIter = msg.data.iteration;
+                    let currentSwarm = prev.currentSwarm || [];
+                    if (currentIter !== prev.current_iter) {
+                      // New iteration, reset swarm
+                      currentSwarm = [particleData];
+                    } else {
+                      // Same iteration, add to swarm (limit to 50 particles to match PSO swarm size)
+                      currentSwarm = [...currentSwarm, particleData].slice(-50);
+                    }
+
+
+                    // Update global best if this is better
+                    // Priority: feasible (UR <= 1.0) > infeasible, then lower weight is better
+                    let globalBest = prev.globalBest;
+                    if (!globalBest) {
+                      globalBest = particleData;
+                    } else {
+                      const isFeasible = particleData.ur <= 1.0;
+                      const bestIsFeasible = globalBest.ur <= 1.0;
+                      
+                      if (isFeasible && !bestIsFeasible) {
+                        // New particle is feasible, old best is not
+                        globalBest = particleData;
+                      } else if (isFeasible && bestIsFeasible) {
+                        // Both feasible, prefer lower weight
+                        if (particleData.weight_kg < globalBest.weight_kg) {
+                          globalBest = particleData;
+                        }
+                      } else if (!isFeasible && !bestIsFeasible) {
+                        // Both infeasible, prefer lower UR (closer to feasible)
+                        if (particleData.ur < globalBest.ur) {
+                          globalBest = particleData;
+                        }
+                      }
+                      // If new is infeasible and best is feasible, keep best
+                    }
+
+                    return {
+                      ...prev,
+                      current_iter: currentIter,
+                      variableNames,
+                      bounds,
+                      history: newHistory,
+                      currentSwarm,
+                      globalBest,
+                      plotImage,
+                    };
+                  });
+                  break;
+                case "pso_heartbeat":
+                  // update liveness indicator
+                  break;
+                case "pso_complete":
+                  setOptimizationDone(true);
+                  event.target.close(); // close the connection
+                  
+                  // Extract final design results from WebSocket message
+                  if (msg.data && msg.data.result) {
+                    const result = msg.data.result;
+                    
+                    // Update output with final design results
+                    // The result.design contains the formatted output from backend
+                    // Format it similar to regular API response
+                    if (result.design) {
+                      const formattedOutput = {};
+                      for (const [key, value] of Object.entries(result.design)) {
+                        const label = value?.label ?? key;
+                        const val = value?.val ?? value?.value ?? value;
+                        if (val !== undefined && val !== null) {
+                          formattedOutput[key] = { label, val };
+                        }
+                      }
+                      
+                      // Note: Output and logs will be set via the hook's internal state
+                      // For now, we'll trigger a re-fetch or use the data directly
+                      // The optimization graph will show the final result
+                      
+                      // Update status to complete
+                      setStatus({ 
+                        step: DESIGN_STATUS.COMPLETE, 
+                        message: 'Optimization complete', 
+                        error: null 
+                      });
+                      
+                      // Store final result for later use (can be accessed via optimizationData)
+                      // CRITICAL: Preserve all existing data (history, currentSwarm, globalBest, etc.)
+                      setOptimizationData((prev) => {
+                        // Ensure we preserve all existing data
+                        const preserved = {
+                          current_iter: prev.current_iter || 0,
+                          variableNames: prev.variableNames || [],
+                          bounds: prev.bounds || { lb: [], ub: [] },
+                          history: prev.history || [],
+                          currentSwarm: prev.currentSwarm || [],
+                          globalBest: prev.globalBest || null,
+                          finalResult: result.design,
+                          finalLogs: result.raw || []
+                        };
+                        console.log('[PSO_COMPLETE] Preserving optimization data:', {
+                          historyCount: preserved.history.length,
+                          currentSwarmCount: preserved.currentSwarm.length,
+                          hasGlobalBest: !!preserved.globalBest,
+                          currentIter: preserved.current_iter
+                        });
+                        return preserved;
+                      });
+                    }
+                  }
+                  break;
+                case "pso_error":
+                  console.error("PSO optimization error:", msg.data);
+                  event.target.close(); // close the connection
+                  // show error; stop loading
+                  break;
+              }
+            }
+          },
+          (error) => {
+            console.error("[PSO] WebSocket Error:", error);
+            setIsWsConnected(false);
+          },
+          () => {
+            console.log("[PSO] WebSocket Disconnected");
+            setIsWsConnected(false);
+            setOptimizationDone(true);
+          }
+        )
+        // For optimized designs, don't call handleSubmit() - WebSocket handles it
+        // The optimization will run via WebSocket and show real-time updates
+      } else {
+        // For non-optimized (Customized) designs, use regular API
+        await handleSubmit();
+      }
       setShowResetButton(true);
 
       // Persist latest inputs to project after design
@@ -847,6 +1163,9 @@ export const EngineeringModule = ({
     setScreenshotTrigger(true);
   };
 
+  const openOptiGraph = () => setShowOptimizationGraph(true);
+  const closeOptiGraph = () => setShowOptimizationGraph(false);
+
   // Default hover dictionary mapping per-part names to labels
   // Prioritize ctxHoverDict values from backend over defaults
   // Use useMemo to recalculate when ctxHoverDict changes
@@ -920,6 +1239,7 @@ export const EngineeringModule = ({
               setCreateDesignReportBool={setCreateDesignReportBool}
               triggerScreenshotCapture={triggerScreenshotCapture}
               selectedOption={extraState.selectedOption}
+              openOptiGraph={openOptiGraph}
               setSelectedOption={(value) =>
                 setExtraState({ ...extraState, selectedOption: value })
               }
@@ -1093,7 +1413,7 @@ export const EngineeringModule = ({
         }, [])}
       </div>
 
-      <div className="relative flex flex-row h-full w-full">
+      <div className="relative flex flex-row h-full w-full" style={{ minHeight: 'calc(100vh - 80px)', maxHeight: 'calc(100vh - 48px)' }}> {/* Adjust for nav height */}
         {/* Input Dock Toggle Button - Fixed to left, shows when dock is closed (Desktop only) */}
         {!showInputDock && !isMobile && (
           <button
@@ -1408,21 +1728,35 @@ export const EngineeringModule = ({
       />
 
       {/* Customization Modals */}
-      {
-        moduleConfig.modalConfig.map((modal) => (
-          <CustomizationModal
+      {moduleConfig.modalConfig.map((modal) => {
+        const ModalComponent = modal.type === "thickness"
+          ? ThicknessSelectionModal
+          : CustomizationModal;
+        return (
+          <ModalComponent
             key={modal.key}
             isOpen={modalStates[modal.key]}
-            onClose={() => updateModalState(modal.key, false)}
-            title="Customized"
+            onClose={() => {
+              // Save selectedItems to inputs when modal closes
+              if (selectedItems[modal.inputKey]) {
+                setInputs({
+                  ...inputs,
+                  [modal.inputKey]: Array.isArray(selectedItems[modal.inputKey])
+                    ? selectedItems[modal.inputKey]
+                    : []
+                });
+              }
+              updateModalState(modal.key, false);
+            }}
+            title={modal.title || "Customized"}
             dataSource={contextData[modal.dataSource] || (modalDynamicSrc[modal.inputKey] || [])} // FIXED: This now includes angleList
             selectedItems={selectedItems[modal.inputKey]}
             onTransferChange={(nextTargetKeys) =>
               updateSelectedItems(modal.inputKey, nextTargetKeys)
             }
           />
-        ))
-      }
+        );
+      })}
 
       {/* Design Preferences Modal (Additional Inputs) */}
       {
@@ -1509,8 +1843,10 @@ export const EngineeringModule = ({
           setStatus({ step: DESIGN_STATUS.IDLE, message: '', error: null });
         }}
         onClose={() => {
-          if (status.step === DESIGN_STATUS.ERROR) {
+          console.log('[DesignStatusModal] onClose called, status:', status.step);
+          if (status.step === DESIGN_STATUS.ERROR || status.step === DESIGN_STATUS.COMPLETE) {
             setStatus({ step: DESIGN_STATUS.IDLE, message: '', error: null });
+            console.log('[DesignStatusModal] Status reset to IDLE');
           }
         }}
       />
@@ -1537,6 +1873,28 @@ export const EngineeringModule = ({
         />
       )}
       {projectCreationModal}
+
+      {/* Plate Girder PSO Dashboard */}
+      <Modal
+        title={<span className="font-bold text-lg flex items-center gap-2"><div className="w-4 h-4 bg-osdag-green flex items-center text-white justify-center text-xs font-black rounded-sm">S</div>PSO Optimization Visualization</span>}
+        open={showOptimizationGraph}
+        onCancel={closeOptiGraph}
+        footer={null}
+        width="90vw"
+        style={{ top: 20 }}
+        bodyStyle={{ height: '85vh', padding: 0 }}
+        destroyOnClose={true}
+        closeIcon={<span className="text-xl">X</span>}
+      >
+        {showOptimizationGraph && (
+          <OptimizationGraph 
+            data={plotlyData}
+            onClose={closeOptiGraph}
+            optimizationDone={optimizationDone}
+            isWsConnected={isWsConnected}
+          />
+        )}
+      </Modal>
     </div>
   );
 };
