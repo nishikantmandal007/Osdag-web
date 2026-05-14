@@ -107,6 +107,11 @@ const calculateMaxDeflection = (structureType, designLoad, memberOption, support
   }
 };
 
+const PLATE_GIRDER_THICKNESS_FALLBACK = [
+  "3", "4", "5", "6", "8", "10", "12", "14", "16", "18",
+  "20", "22", "24", "26", "28", "30", "32", "36", "40"
+];
+
 export const plateGirderConfig = {
   sessionName: "Plate Girder Design",
   routePath: "/design/flexure/plate_girder",
@@ -250,13 +255,20 @@ export const plateGirderConfig = {
 
   buildSubmissionParams: (inputs, allSelected, lists, extraState) => {
     const getArrayParam = (allSelectedFlag, fullList, selectedList) => {
+      const normalizeList = (value) => {
+        const values = Array.isArray(value) ? value : [value];
+        return [...new Set(values
+          .map(item => item === undefined || item === null ? "" : String(item))
+          .filter(item => item && item !== "All" && item !== "Select Section"))];
+      };
+      const availableList = normalizeList(fullList);
+
       if (allSelectedFlag) {
-        return fullList.filter(item => item !== "All" && item !== "Select Section");
+        return availableList.length ? availableList : PLATE_GIRDER_THICKNESS_FALLBACK;
       }
-      if (Array.isArray(selectedList)) {
-        return selectedList.filter(item => item !== "All" && item !== "Select Section");
-      }
-      return [selectedList].filter(item => item !== "All" && item !== "Select Section");
+
+      const selectedValues = normalizeList(selectedList);
+      return selectedValues.length ? selectedValues : PLATE_GIRDER_THICKNESS_FALLBACK;
     };
 
     // Convert member_length from mm to m (backend expects m)
@@ -324,9 +336,9 @@ export const plateGirderConfig = {
         "Total.Design_Type": String(inputs.design_type || "Customized"),
       
         // --- Thicknesses (Must be Arrays) ---
-        "Web.Thickness": webThicknessList.length > 0 ? webThicknessList : ["6"],
-        "TopFlange.Thickness": topFlangeThicknessList.length > 0 ? topFlangeThicknessList : ["6"],
-        "BottomFlange.Thickness": bottomFlangeThicknessList.length > 0 ? bottomFlangeThicknessList : ["6"],
+        "Web.Thickness": webThicknessList.length > 0 ? webThicknessList : PLATE_GIRDER_THICKNESS_FALLBACK,
+        "TopFlange.Thickness": topFlangeThicknessList.length > 0 ? topFlangeThicknessList : PLATE_GIRDER_THICKNESS_FALLBACK,
+        "BottomFlange.Thickness": bottomFlangeThicknessList.length > 0 ? bottomFlangeThicknessList : PLATE_GIRDER_THICKNESS_FALLBACK,
       
         // --- Design Preferences ---
         "Design.Design_Type_Flexure": String(inputs.support_type || "Major Laterally Supported"),
@@ -593,5 +605,4 @@ export const plateGirderConfig = {
     }
   ],
 };
-
 
